@@ -1,3 +1,4 @@
+from django.contrib.contenttypes.models import ContentType
 from django_rq import get_queue
 
 from netbox.jobs import JobRunner, system_job
@@ -11,25 +12,33 @@ def GetSyncInterval():
     return pluginsettings.backgroundsync.objects.interval
 
 
+def _object_key(instance):
+    # The same identity as Model.__eq__: concrete model and primary key
+    if instance is None:
+        return None
+    return (instance._meta.concrete_model, instance.pk)
+
+
 @system_job(interval=GetSyncInterval())
 class SyncObjectsJob(JobRunner):
     class Meta:
         name = 'Zabbix Sync Hosts job'
 
     def run(self, *args, **kwargs):
-        synced_objects = []
-        for obj in ZabbixServerAssignment.objects.all():
-            # dont try to sync ZabbixConfigurationGroups
-            if isinstance(obj.assigned_object, ZabbixConfigurationGroup):
-                continue
+        # dont try to sync ZabbixConfigurationGroups
+        configgroup_type = ContentType.objects.get_for_model(ZabbixConfigurationGroup)
+        assignments = ZabbixServerAssignment.objects.exclude(assigned_object_type=configgroup_type).prefetch_related('assigned_object')
 
-            if obj.assigned_object in synced_objects:
-                continue
-            else:
-                synced_objects.append(obj.assigned_object)
-
+        synced_objects = set()
+        queue = get_queue('low')
+        for obj in assignments:
             instance = obj.assigned_object
-            queue = get_queue('low')
+
+            key = _object_key(instance)
+            if key in synced_objects:
+                continue
+            synced_objects.add(key)
+
             queue.enqueue_job(
                 queue.create_job(
                     func='nbxsync.worker.synchost',

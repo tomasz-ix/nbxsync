@@ -1,7 +1,9 @@
 from unittest.mock import MagicMock, patch
 
 from django.contrib.contenttypes.models import ContentType
+from django.db import connection
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 
 from dcim.models import Device
 from utilities.testing import create_test_device
@@ -63,7 +65,7 @@ class SyncObjectsSystemJobTestCase(TestCase):
         job = SyncObjectsJob(job=MagicMock())
         job.run()
 
-        mock_get_queue.assert_not_called()
+        queue.create_job.assert_not_called()
 
     @patch('nbxsync.systemjobs.sync_objects.get_queue')
     def test_run_stops_entirely_on_duplicate_assigned_object(self, mock_get_queue):
@@ -92,4 +94,58 @@ class SyncObjectsSystemJobTestCase(TestCase):
         job = SyncObjectsJob(job=MagicMock())
         job.run()
 
-        mock_get_queue.assert_not_called()
+        mock_get_queue.return_value.create_job.assert_not_called()
+
+    @patch('nbxsync.systemjobs.sync_objects.get_queue')
+    def test_run_gets_queue_once(self, mock_get_queue):
+        mock_get_queue.return_value = MagicMock()
+
+        ZabbixServerAssignment.objects.create(zabbixserver=self.server, assigned_object_type=self.device_ct, assigned_object_id=self.device1.pk)
+        ZabbixServerAssignment.objects.create(zabbixserver=self.server, assigned_object_type=self.device_ct, assigned_object_id=self.device2.pk)
+
+        SyncObjectsJob(job=MagicMock()).run()
+
+        mock_get_queue.assert_called_once_with('low')
+
+    @patch('nbxsync.systemjobs.sync_objects.get_queue')
+    def test_run_queries_do_not_grow_with_assignments(self, mock_get_queue):
+        mock_get_queue.return_value = MagicMock()
+        cfg = ZabbixConfigurationGroup.objects.create(name='Test CFG', description='')
+        ZabbixServerAssignment.objects.create(zabbixserver=self.server, assigned_object_type=self.cfg_ct, assigned_object_id=cfg.pk)
+        ZabbixServerAssignment.objects.create(zabbixserver=self.server, assigned_object_type=self.device_ct, assigned_object_id=self.device1.pk)
+
+        with CaptureQueriesContext(connection) as one:
+            SyncObjectsJob(job=MagicMock()).run()
+
+        for i in range(3):
+            device = create_test_device(name=f'SyncObjects Query Dev {i}')
+            ZabbixServerAssignment.objects.create(zabbixserver=self.server, assigned_object_type=self.device_ct, assigned_object_id=device.pk)
+
+        with CaptureQueriesContext(connection) as four:
+            SyncObjectsJob(job=MagicMock()).run()
+
+        self.assertEqual(len(four), len(one))
+        self.assertEqual(mock_get_queue.return_value.create_job.call_count, 1 + 4)
+
+    @patch('nbxsync.systemjobs.sync_objects.get_queue')
+    def test_run_enqueues_one_job_for_missing_objects(self, mock_get_queue):
+        # An assignment whose object is gone gives one job with None, for all such assignments
+        queue = MagicMock()
+        mock_get_queue.return_value = queue
+
+        server2 = ZabbixServer.objects.create(name='Zabbix Server 2', url='http://zabbix2.local', token='token2')
+        gone = [
+            ZabbixServerAssignment.objects.create(zabbixserver=self.server, assigned_object_type=self.device_ct, assigned_object_id=self.device2.pk).pk,
+            ZabbixServerAssignment.objects.create(zabbixserver=server2, assigned_object_type=self.device_ct, assigned_object_id=self.device1.pk).pk,
+        ]
+        ZabbixServerAssignment.objects.create(zabbixserver=self.server, assigned_object_type=self.device_ct, assigned_object_id=self.device1.pk)
+        # save() validates the object, update() doesn't
+        ZabbixServerAssignment.objects.filter(pk=gone[0]).update(assigned_object_id=999990)
+        ZabbixServerAssignment.objects.filter(pk=gone[1]).update(assigned_object_id=999991)
+
+        SyncObjectsJob(job=MagicMock()).run()
+
+        enqueued_instances = [call.kwargs.get('args')[0] for call in queue.create_job.call_args_list]
+        self.assertEqual(enqueued_instances.count(None), 1)
+        self.assertIn(self.device1, enqueued_instances)
+        self.assertEqual(len(enqueued_instances), 2)
