@@ -17,8 +17,17 @@ class SafeDeleteTests(TestCase):
 
         result = safe_delete(DummySync, mock_obj, extra_args={'id': 123})
 
-        mock_run_op.assert_called_once_with(DummySync, mock_obj, 'delete', {'id': 123})
+        mock_run_op.assert_called_once_with(DummySync, mock_obj, 'delete', {'id': 123}, connections=None)
         self.assertEqual(result, mock_result)
+
+    @patch('nbxsync.utils.sync.safe_delete.run_zabbix_operation')
+    def test_safe_delete_passes_connections(self, mock_run_op):
+        mock_obj = MagicMock()
+        connections = MagicMock()
+
+        safe_delete(DummySync, mock_obj, connections=connections)
+
+        mock_run_op.assert_called_once_with(DummySync, mock_obj, 'delete', {}, connections=connections)
 
     @patch('nbxsync.utils.sync.safe_delete.run_zabbix_operation', side_effect=ValueError('fail'))
     def test_safe_delete_raises_wrapped_runtime_error(self, mock_run_op):

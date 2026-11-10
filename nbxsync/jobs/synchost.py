@@ -5,7 +5,7 @@ from django.contrib.contenttypes.models import ContentType
 from nbxsync.choices.zabbixstatus import ZabbixHostStatus
 from nbxsync.models import ZabbixServerAssignment
 from nbxsync.settings import get_plugin_settings
-from nbxsync.utils import get_assigned_zabbixobjects
+from nbxsync.utils import ZabbixConnections, get_assigned_zabbixobjects
 from nbxsync.utils.sync import HostGroupSync, HostInterfaceSync, HostSync, ProxyGroupSync, ProxySync, run_zabbix_operation
 from nbxsync.utils.sync.safe_delete import safe_delete
 from nbxsync.utils.sync.safe_sync import safe_sync
@@ -19,6 +19,7 @@ __all__ = ('SyncHostJob',)
 class SyncHostJob:
     def __init__(self, **kwargs):
         self.instance = kwargs.get('instance')  # This is the Device or VirtualMachine object
+        self.connections = None  # Zabbix sessions of the job, see run()
 
     def run(self):
         object_ct = ContentType.objects.get_for_model(self.instance)
@@ -31,59 +32,59 @@ class SyncHostJob:
         status_mapping = getattr(pluginsettings.statusmapping, object_type, {})
         zabbix_status = status_mapping.get(status)
 
-        for assignment in zabbixserver_assignments:
-            if not assignment.sync_enabled or not assignment.zabbixserver.sync_enabled:
-                continue
+        with ZabbixConnections() as self.connections:
+            for assignment in zabbixserver_assignments:
+                if not assignment.sync_enabled or not assignment.zabbixserver.sync_enabled:
+                    continue
 
-            if zabbix_status == ZabbixHostStatus.DELETED:
-                self.delete_host(assignment)
-            else:
-                self.check_default_hostinterface(assignment)
-                self.sync_host(assignment)
-                self.verify_hostinterfaces(assignment)
+                if zabbix_status == ZabbixHostStatus.DELETED:
+                    self.delete_host(assignment)
+                else:
+                    # Shared by all steps: the syncs set the Zabbix IDs on these objects
+                    all_objects = get_assigned_zabbixobjects(self.instance, zabbixserver=assignment.zabbixserver)
+                    # Add the assigned_objects attribute, so we dont have to do this expensive calculation again later on
+                    assignment.assigned_objects = all_objects
 
-            if object_type == 'device' and zabbix_status != ZabbixHostStatus.DELETED and pluginsettings.trigger_dependencies.enabled:
-                try:
-                    sync_device_trigger_dependencies(self.instance)
-                except Exception:
-                    logger.exception('Trigger dependency sync failed for %s; continuing.', self.instance)
+                    self.check_default_hostinterface(assignment, all_objects)
+                    self.sync_host(assignment, all_objects)
+                    self.verify_hostinterfaces(assignment, all_objects)
+
+                if object_type == 'device' and zabbix_status != ZabbixHostStatus.DELETED and pluginsettings.trigger_dependencies.enabled:
+                    try:
+                        sync_device_trigger_dependencies(self.instance)
+                    except Exception:
+                        logger.exception('Trigger dependency sync failed for %s; continuing.', self.instance)
 
     def delete_host(self, assignment):
-        safe_delete(HostSync, assignment)
+        safe_delete(HostSync, assignment, connections=self.connections)
 
-    def verify_hostinterfaces(self, assignment):
-        all_objects = get_assigned_zabbixobjects(self.instance, zabbixserver=assignment.zabbixserver)
-        run_zabbix_operation(HostSync, assignment, 'verify_hostinterfaces', extra_args={'all_objects': all_objects})
+    def verify_hostinterfaces(self, assignment, all_objects):
+        run_zabbix_operation(HostSync, assignment, 'verify_hostinterfaces', extra_args={'all_objects': all_objects}, connections=self.connections)
 
-    def check_default_hostinterface(self, assignment):
-        all_objects = get_assigned_zabbixobjects(self.instance, zabbixserver=assignment.zabbixserver)
-        run_zabbix_operation(HostSync, assignment, 'check_default_hostinterface', extra_args={'all_objects': all_objects})
+    def check_default_hostinterface(self, assignment, all_objects):
+        run_zabbix_operation(HostSync, assignment, 'check_default_hostinterface', extra_args={'all_objects': all_objects}, connections=self.connections)
 
-    def sync_host(self, assignment):
+    def sync_host(self, assignment, all_objects):
         try:
-            all_objects = get_assigned_zabbixobjects(self.instance, zabbixserver=assignment.zabbixserver)
-            # Add the assigned_objects attribute, so we dont have to do this expensive calculation again later on :)
-            assignment.assigned_objects = all_objects
-
             # Create all hostgroups
             for hostgroup in all_objects['hostgroups']:
-                safe_sync(HostGroupSync, hostgroup)
+                safe_sync(HostGroupSync, hostgroup, connections=self.connections)
 
             # Sync ProxyGroups and proxies (in that order!)
             # If the ZabbixServer Assignment has a Proxy, sync it
             if assignment.zabbixproxy:
                 # If the ZabbixProxy is assigned to a ProxyGroup, sync the group first.
                 if assignment.zabbixproxy.proxygroup:
-                    safe_sync(ProxyGroupSync, assignment.zabbixproxy.proxygroup)
-                safe_sync(ProxySync, assignment.zabbixproxy)
+                    safe_sync(ProxyGroupSync, assignment.zabbixproxy.proxygroup, connections=self.connections)
+                safe_sync(ProxySync, assignment.zabbixproxy, connections=self.connections)
 
             # If the ZabbixServer Assignment has a ProxyGroup, sync it
             if assignment.zabbixproxygroup:
-                safe_sync(ProxyGroupSync, assignment.zabbixproxygroup)
+                safe_sync(ProxyGroupSync, assignment.zabbixproxygroup, connections=self.connections)
 
             # Sync the actual Host
             try:
-                safe_sync(HostSync, assignment, extra_args={'all_objects': all_objects})
+                safe_sync(HostSync, assignment, extra_args={'all_objects': all_objects}, connections=self.connections)
             except Exception as e:
                 # This can happen, in cases where the host exists, a new HostInterface is added (SNMP for example) and a new template (which requires SNMP)
                 # In such cases, the Host Update will fail, due to the Interface not existing yet.
@@ -97,9 +98,9 @@ class SyncHostJob:
             # - id
             hostinterfaces_sorted = sorted(all_objects['hostinterfaces'], key=lambda hostinterface: (-int(hostinterface.interface_type == 1), hostinterface.type, hostinterface.id))
             for hostinterface in hostinterfaces_sorted:
-                safe_sync(HostInterfaceSync, hostinterface, extra_args={'hostid': assignment.hostid})
+                safe_sync(HostInterfaceSync, hostinterface, extra_args={'hostid': assignment.hostid}, connections=self.connections)
 
-            safe_sync(HostSync, assignment, extra_args={'all_objects': all_objects})
+            safe_sync(HostSync, assignment, extra_args={'all_objects': all_objects}, connections=self.connections)
 
         except Exception as e:
             raise RuntimeError(f'Unexpected error: {e}')

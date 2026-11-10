@@ -86,3 +86,35 @@ class RunZabbixOperationTests(TestCase):
         self.assertIn('DummySync does not implement `not_a_method()`', str(ctx.exception))
 
         self.netbox_obj.update_sync_info.assert_called_once_with(success=False, message='Unexpected error: DummySync does not implement `not_a_method()`.')
+
+    @patch('nbxsync.utils.sync.run_zabbix_operations.ZabbixConnection')
+    @patch('nbxsync.models.ZabbixServer.objects.get')
+    def test_connections_reuse_session(self, mock_get, mock_conn):
+        self.sync_class.resolve_zabbixserver.return_value = self.zabbixserver
+        mock_get.return_value = self.zabbixserver
+        mock_api = MagicMock()
+        connections = MagicMock()
+        connections.__contains__.side_effect = [False, True]
+        connections.get.return_value = mock_api
+
+        run_zabbix_operation(self.sync_class, self.netbox_obj, 'run', connections=connections)
+        run_zabbix_operation(self.sync_class, self.netbox_obj, 'run', connections=connections)
+
+        # Loads the server for the first operation only, and never opens its own session
+        mock_get.assert_called_once_with(pk=self.zabbixserver.id)
+        mock_conn.assert_not_called()
+        self.assertEqual(connections.get.call_count, 2)
+        self.sync_class.assert_called_with(mock_api, self.netbox_obj)
+
+    @patch('nbxsync.models.ZabbixServer.objects.get')
+    def test_connections_login_error(self, mock_get):
+        self.sync_class.resolve_zabbixserver.return_value = self.zabbixserver
+        mock_get.return_value = self.zabbixserver
+        connections = MagicMock()
+        connections.__contains__.return_value = False
+        connections.get.side_effect = ConnectionError('login failed')
+
+        with self.assertRaises(ConnectionError):
+            run_zabbix_operation(self.sync_class, self.netbox_obj, 'run', connections=connections)
+
+        self.netbox_obj.update_sync_info.assert_called_once_with(success=False, message='Zabbix Login error: login failed')

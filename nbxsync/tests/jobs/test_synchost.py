@@ -11,6 +11,7 @@ from nbxsync.choices import ZabbixProxyTypeChoices, ZabbixTLSChoices
 from nbxsync.choices.zabbixstatus import ZabbixHostStatus
 from nbxsync.jobs.synchost import SyncHostJob
 from nbxsync.models import ZabbixHostgroup, ZabbixHostgroupAssignment, ZabbixHostInterface, ZabbixProxy, ZabbixProxyGroup, ZabbixServer, ZabbixServerAssignment
+from nbxsync.utils import get_assigned_zabbixobjects
 from nbxsync.utils.sync import ProxyGroupSync
 from nbxsync.settings import get_plugin_settings
 
@@ -61,9 +62,9 @@ class SyncHostJobTestCase(TestCase):
 
         self.zabbixhostgroupassignment = ZabbixHostgroupAssignment.objects.create(zabbixhostgroup=self.hostgroup, assigned_object_type=self.device_ct, assigned_object_id=self.device.id)
 
-        # Patch ZabbixConnection to avoid real HTTP calls
-        self.zabbix_patcher = patch('nbxsync.utils.sync.run_zabbix_operations.ZabbixConnection')
-        mock_conn_class = self.zabbix_patcher.start()
+        # Patch ZabbixAPI to avoid real HTTP calls; every session constructs one
+        self.zabbix_patcher = patch('nbxsync.utils.zabbixconnection.ZabbixAPI')
+        self.mock_api_class = self.zabbix_patcher.start()
         self.addCleanup(self.zabbix_patcher.stop)
 
         # Define a stable mock API
@@ -96,12 +97,41 @@ class SyncHostJobTestCase(TestCase):
         mock_api.proxygroup.get.return_value = [{'proxy_groupid': 99, 'failover_delay': '1m', 'min_online': 1}]
         mock_api.proxygroup.create.return_value = {'proxy_groupids': [99]}
 
-        # Assign API to context manager return
-        mock_conn_class.return_value.__enter__.return_value = mock_api
+        self.mock_api_class.return_value = mock_api
+        self.mock_api = mock_api
 
     def test_run_sync_host_success(self):
         job = SyncHostJob(instance=self.device)
         job.run()
+
+    def test_run_uses_one_zabbix_session(self):
+        job = SyncHostJob(instance=self.device)
+        job.run()
+
+        # Host group, proxy group, proxy, host (twice), interface and the checks share one session
+        self.mock_api_class.assert_called_once()
+        self.mock_api.login.assert_called_once_with(token='abc123')
+        self.mock_api.logout.assert_called_once()
+        self.assertGreater(self.mock_api.host.update.call_count, 0)
+
+    def test_run_resolves_assigned_objects_once(self):
+        with patch('nbxsync.jobs.synchost.get_assigned_zabbixobjects', wraps=get_assigned_zabbixobjects) as mock_gao:
+            job = SyncHostJob(instance=self.device)
+            job.run()
+
+        mock_gao.assert_called_once_with(self.device, zabbixserver=self.zabbixserver)
+
+    def test_run_steps_share_assigned_objects(self):
+        # The interface ID that the interface sync sets must reach verify_hostinterfaces
+        self.mock_api.hostinterface.get.return_value = [{'interfaceid': '999', 'hostid': '12345', 'main': '1', 'type': '1'}]
+        self.mock_api.hostinterface.create.return_value = {'interfaceids': ['999']}
+
+        job = SyncHostJob(instance=self.device)
+        job.run()
+
+        self.hostinterface.refresh_from_db()
+        self.assertEqual(self.hostinterface.interfaceid, 999)
+        self.mock_api.hostinterface.delete.assert_not_called()
 
     @patch('nbxsync.jobs.synchost.sync_device_trigger_dependencies')
     def test_run_skips_trigger_dependency_sync_by_default(self, mock_sync_dependencies):
