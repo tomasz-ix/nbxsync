@@ -1,4 +1,4 @@
-from .zabbixconnection import ZabbixConnection  # noqa: F401
+from .zabbixconnection import ZabbixConnection, ZabbixConnections  # noqa: F401
 from .helpers import *
 from .inheritance import *
 from .sync import *

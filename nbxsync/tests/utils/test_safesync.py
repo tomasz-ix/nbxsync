@@ -17,8 +17,17 @@ class SafeSyncTests(TestCase):
 
         result = safe_sync(DummySync, mock_obj, extra_args={'foo': 'bar'})
 
-        mock_run_op.assert_called_once_with(DummySync, mock_obj, 'sync', {'foo': 'bar'})
+        mock_run_op.assert_called_once_with(DummySync, mock_obj, 'sync', {'foo': 'bar'}, connections=None)
         self.assertEqual(result, mock_result)
+
+    @patch('nbxsync.utils.sync.safe_sync.run_zabbix_operation')
+    def test_safe_sync_passes_connections(self, mock_run_op):
+        mock_obj = MagicMock()
+        connections = MagicMock()
+
+        safe_sync(DummySync, mock_obj, connections=connections)
+
+        mock_run_op.assert_called_once_with(DummySync, mock_obj, 'sync', {}, connections=connections)
 
     @patch('nbxsync.utils.sync.safe_sync.run_zabbix_operation', side_effect=ValueError('Oops'))
     def test_safe_sync_raises_wrapped_runtime_error(self, mock_run_op):
